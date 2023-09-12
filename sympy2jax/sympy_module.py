@@ -113,9 +113,12 @@ class _AbstractNode(eqx.Module):
 class _Symbol(_AbstractNode):
     _name: str
 
-    def __init__(self, expr: sympy.Expr):
+    def __init__(
+        self,
+        expr: sympy.Expr,
+    ):
         self._name = expr.name
-
+        
     def __call__(self, memodict: dict):
         try:
             return memodict[self._name]
@@ -126,6 +129,31 @@ class _Symbol(_AbstractNode):
         # memodict not needed as sympy deduplicates internally
         return sympy.Symbol(self._name)
 
+class _PosSymbol(_Symbol):
+    _index: Optional[int]
+    _arr: Optional[str]
+
+    def __init__(
+        self,
+        expr: sympy.Expr,
+        index: Optional[int] = None,
+        arr: Optional[str] = None
+    ):
+        self._name = expr.name
+        self._index = index
+        self._arr = arr
+
+    def __call__(self, memodict: dict):
+        try:
+            return memodict[self._arr][self._index]
+        except KeyError as e:
+            if self._arr not in memodict:
+                raise KeyError(f"Array '{self._arr}' for positional arguments is missing") from e
+            elif self._index >= memodict[self._arr].shape[0]:
+                shape = memodict[self._arr].shape
+                raise IndexError(f"Index {self._index} is out of bonds for array {self._arr} of shape {shape}")
+
+    
 
 def _maybe_array(val, make_array):
     if make_array:
@@ -193,14 +221,19 @@ class _Func(_AbstractNode):
     _args: list
 
     def __init__(
-        self, expr: sympy.Expr, memodict: dict, func_lookup: dict, make_array: bool
+        self,
+        expr: sympy.Expr,
+        memodict: dict,
+        func_lookup: dict,
+        make_array: bool,
+        positionals: dict,
     ):
         try:
             self._func = func_lookup[expr.func]
         except KeyError as e:
             raise KeyError(f"Unsupported Sympy type {type(expr)}") from e
         self._args = [
-            _sympy_to_node(arg, memodict, func_lookup, make_array) for arg in expr.args
+            _sympy_to_node(arg, memodict, func_lookup, make_array, positionals) for arg in expr.args
         ]
 
     def __call__(self, memodict: dict):
@@ -226,13 +259,20 @@ class _Func(_AbstractNode):
 
 
 def _sympy_to_node(
-    expr: sympy.Expr, memodict: dict, func_lookup: dict, make_array: bool
+    expr: sympy.Expr,
+    memodict: dict,
+    func_lookup: dict,
+    make_array: bool,
+    positionals: dict[str, list[str]],
 ) -> _AbstractNode:
     try:
         return memodict[expr]
     except KeyError:
-        if isinstance(expr, sympy.Symbol):
+        if isinstance(expr, sympy.Symbol) and not positionals:
             out = _Symbol(expr)
+        elif isinstance(expr, sympy.Symbol) and positionals:
+            arr, index = _retrieve_index(expr, positionals)
+            out = _PosSymbol(expr, index, arr)
         elif isinstance(expr, sympy.Integer):
             out = _Integer(expr, make_array)
         elif isinstance(expr, sympy.Float):
@@ -240,9 +280,23 @@ def _sympy_to_node(
         elif isinstance(expr, sympy.Rational):
             out = _Rational(expr, make_array)
         else:
-            out = _Func(expr, memodict, func_lookup, make_array)
+            out = _Func(expr, memodict, func_lookup, make_array, positionals)
         memodict[expr] = out
         return out
+
+def _retrieve_index(expr, positionals: dict):
+    if not positionals:
+        return None, None
+    
+    filtered = [
+        (arr, names.index(expr.name))
+        for arr, names in positionals.items()
+    ]
+
+    assert filtered != [], f"Symbol '{expr.name}' is missing in any positional array."
+    assert len(filtered) == 1, f"Symbol '{expr.name}' occurs multiple times."
+
+    return filtered[0]
 
 
 def _is_node(x):
@@ -258,8 +312,14 @@ class SymbolicModule(eqx.Module):
         expressions: PyTree,
         extra_funcs: Optional[dict] = None,
         make_array: bool = True,
+        positionals: Optional[dict] = None,
         **kwargs,
     ):
+        if positionals:
+            self._check_positionals(positionals)
+        else:
+            positionals = {}
+
         super().__init__(**kwargs)
         if extra_funcs is None:
             lookup = _lookup
@@ -272,8 +332,20 @@ class SymbolicModule(eqx.Module):
             memodict=dict(),
             func_lookup=lookup,
             make_array=make_array,
+            positionals=positionals,
         )
         self.nodes = jax.tree_map(_convert, expressions)
+
+    @staticmethod
+    def _check_positionals(positionals):
+        assert all(isinstance(pos, list) for pos in positionals.values()), (
+            f"Expected lists as positional - Received types {set(type(kw) for kw in kwargs.values())}"
+        )
+
+        _has_single_type = lambda l: len(set([type(e) for e in l])) == 1
+        assert all(_has_single_type(pos) for pos in positionals.values()), (
+            "Received mixed types within positionals. Please make sure to pass lists of strings."
+        )
 
     def sympy(self) -> sympy.Expr:
         if self.has_extra_funcs:
